@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Midas Polymarket Trading Bot
-Deployed on Render.com (non-US region)
+Deployed on Render.com (non-US region — Frankfurt)
 Receives trade commands via HTTP API, executes on Polymarket CLOB
+Live market data from SimpleFunctions.dev, trading via CLOB API
 """
 
 import os
@@ -19,14 +20,14 @@ app = Flask(__name__)
 KEY_ID = os.environ.get("POLY_KEY_ID", "0be336d1-c527-45e4-9b60-eab8ad430082")
 SECRET = os.environ.get("POLY_SECRET", "FmD8SxPaoJ+CGVBcqcifGOjdcGW19HNxjv/Rd5D1sE7CbaYBS/VcxYozARkvqI0vxO9wyJktzYRuGB34Pj+vbA==")
 POLY_BASE = "https://clob.polymarket.com"
+SF_BASE = "https://simplefunctions.dev/api"
 
 # Risk controls
-MAX_TRADE_SIZE_CENTS = int(os.environ.get("MAX_TRADE_CENTS", 500))  # $5 max per trade default
-BANKROLL = float(os.environ.get("BANKROLL", 100.0))  # assume $100 bankroll
+MAX_TRADE_SIZE_CENTS = int(os.environ.get("MAX_TRADE_CENTS", 500))
+BANKROLL = float(os.environ.get("BANKROLL", 100.0))
 
 
 def signed_headers(method, path, body=""):
-    """Build L2 HMAC auth headers for Polymarket CLOB."""
     ts = str(int(time.time()))
     sign_str = ts + method + path + (body or "")
     sig = hmac.new(SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
@@ -40,43 +41,50 @@ def signed_headers(method, path, body=""):
 
 
 def poly_get(path):
-    r = requests.get(POLY_BASE + path, headers=signed_headers("GET", path))
-    return r
+    return requests.get(POLY_BASE + path, headers=signed_headers("GET", path))
 
 
 def poly_post(path, data):
-    r = requests.post(POLY_BASE + path, headers=signed_headers("POST", path, json.dumps(data) if data else ""), json=data)
-    return r
+    body = json.dumps(data) if data else ""
+    return requests.post(POLY_BASE + path, headers=signed_headers("POST", path, body), json=data)
 
 
-def get_markets(limit=50, closed=False):
-    """Fetch active markets."""
-    r = poly_get(f"/markets?limit={limit}&closed={closed}")
+def get_sf_answer(topic):
+    """Get probability for a topic from SimpleFunctions."""
+    r = requests.get(f"{SF_BASE}/public/answer/{topic}", timeout=10)
     if r.status_code == 200:
-        return r.json().get("data", [])
+        return r.json()
+    return None
+
+
+def scan_sf_markets(query, limit=20):
+    """Scan markets on SimpleFunctions."""
+    r = requests.get(f"{SF_BASE}/public/scan", params={"q": query, "limit": limit}, timeout=10)
+    if r.status_code == 200:
+        return r.json()
     return []
 
 
-def get_live_markets():
-    """Get currently active, non-archived markets with volume."""
-    r = poly_get("/markets?limit=500&closed=false&archived=false")
-    if r.status_code != 200:
-        return []
-    all_markets = r.json().get("data", [])
-    return [m for m in all_markets if m.get("active") and not m.get("archived") and not m.get("closed")]
+def get_live_markets_via_sf():
+    """Get live Polymarket markets via SimpleFunctions scan."""
+    try:
+        r = requests.get(f"{SF_BASE}/public/scan", params={"q": "*", "limit": 50, "venue": "polymarket"}, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+    return {"error": "failed"}
 
 
 def size_position(yes_price, edge_pct=0.10):
-    """Kelly Criterion Lite: edge / odds × bankroll × 0.3"""
     if yes_price < 0.01:
         return 0
-    odds = 1 - yes_price  # implied no price
+    odds = 1 - yes_price
     if odds <= 0:
         return 0
     edge = edge_pct
     size = (edge / odds) * BANKROLL * 0.3
     size_cents = int(size * 100)
-    # Cap at max per trade
     return min(size_cents, MAX_TRADE_SIZE_CENTS)
 
 
@@ -87,7 +95,9 @@ def health():
 
 @app.route("/trade", methods=["POST"])
 def trade():
-    """Execute a trade. POST /trade with {condition_id, side, yes_price}"""
+    """Execute a trade.
+    POST /trade with JSON: {condition_id, side, yes_price, size_cents}
+    """
     data = request.json or {}
     condition_id = data.get("condition_id")
     side = data.get("side", "BUY").upper()
@@ -98,74 +108,73 @@ def trade():
         return jsonify({"error": "condition_id required"}), 400
     if size <= 0 or size > MAX_TRADE_SIZE_CENTS:
         return jsonify({"error": f"size_cents must be 1-{MAX_TRADE_SIZE_CENTS}"}), 400
+    if yes_price <= 0 or yes_price >= 1:
+        return jsonify({"error": "yes_price must be 0-1"}), 400
 
-    # Build the order
     order_data = {
         "condition_id": condition_id,
-        "size": size / 100.0,  # convert cents to dollars
+        "size": size / 100.0,
         "side": side,
         "price": yes_price,
     }
 
     r = poly_post("/orders", order_data)
-    result = {"status": r.status_code, "response": r.text[:200], "order": order_data}
+    result = {"http_status": r.status_code, "response": r.text[:300], "order": order_data}
 
-    if r.status_code == 200 or r.status_code == 201:
+    if r.status_code in (200, 201):
         return jsonify({"success": True, **result})
     else:
         return jsonify({"success": False, **result}), r.status_code
 
 
-@app.route("/markets")
-def markets():
-    """List available markets."""
-    live = get_live_markets()
-    return jsonify({
-        "count": len(live),
-        "markets": [
-            {
-                "condition_id": m.get("condition_id"),
-                "question": m.get("question", "")[:80],
-                "yes_price": m.get("tokens", [{}])[1].get("price") if len(m.get("tokens", [])) > 1 else None,
-                "volume": m.get("volume"),
-                "close_time": m.get("end_date_iso"),
-            }
-            for m in live[:30]
-        ]
-    })
+@app.route("/scan")
+def scan():
+    """Scan markets by query. ?q=gold&limit=20"""
+    q = request.args.get("q", "*")
+    limit = int(request.args.get("limit", 20))
+    result = scan_sf_markets(q, limit)
+    return jsonify(result)
+
+
+@app.route("/world")
+def world():
+    """Get world state from SimpleFunctions."""
+    r = requests.get(f"{SF_BASE}/agent/world", timeout=15)
+    if r.status_code == 200:
+        return jsonify(r.json())
+    return jsonify({"error": "failed"}), 500
 
 
 @app.route("/best-trade")
 def best_trade():
-    """Find best current trade opportunity based on market scan."""
-    live = get_live_markets()
+    """Find best trade opportunities from SimpleFunctions live data."""
+    r = requests.get(f"{SF_BASE}/public/scan", params={"q": "*", "limit": 50, "venue": "polymarket", "vol24h_min": 1000}, timeout=15)
+    if r.status_code != 200:
+        return jsonify({"error": "sf scan failed"}), 500
+
+    markets = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
     opportunities = []
 
-    for m in live:
-        toks = m.get("tokens", [])
-        if len(toks) < 2:
+    for m in markets:
+        price = m.get("price", 0) / 100.0  # price in cents → decimal
+        volume = float(m.get("volume24h", 0) or m.get("volume", 0) or 0)
+        if volume < 500 or price <= 0:
             continue
-        yes_tok = toks[1]
-        price = yes_tok.get("price", 0)
-        volume = float(m.get("volume", 0) or 0)
-        if volume < 100 or price <= 0:
-            continue
-
         sz = size_position(price)
-        if sz < 50:  # min $0.50
+        if sz < 50:
             continue
-
+        ticker = m.get("bareTicker", m.get("ticker", ""))
         opportunities.append({
-            "condition_id": m.get("condition_id"),
-            "question": m.get("question", "")[:80],
+            "ticker": ticker,
+            "question": m.get("title", "")[:80],
             "yes_price": price,
             "size_cents": sz,
-            "volume": volume,
+            "volume_24h": volume,
+            "spread": m.get("spread", 0),
         })
 
-    # Sort by implied edge (price < 0.5 = potential value)
-    opportunities.sort(key=lambda x: abs(0.5 - x["yes_price"]), reverse=True)
-    return jsonify({"opportunities": opportunities[:5]})
+    opportunities.sort(key=lambda x: x["volume_24h"], reverse=True)
+    return jsonify({"opportunities": opportunities[:10]})
 
 
 if __name__ == "__main__":
