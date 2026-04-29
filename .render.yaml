@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: midas-trader
+    env: docker
+    region: london
+    plan: free
+    healthCheckPath: /health
+    port: 3000
+    envVars:
+      - key: POLY_KEY_ID
+        value: "0be336d1-c527-45e4-9b60-eab8ad430082"
+      - key: POLY_SECRET
+        value: "FmD8SxPaoJ+CGVBcqcifGOjdcGW19HNxjv/Rd5D1sE7CbaYBS/VcxYozARkvqI0vxO9wyJktzYRuGB34Pj+vbA=="
+      - key: BANKROLL
+        value: "100"
+      - key: MAX_TRADE_CENTS
+        value: "500"
